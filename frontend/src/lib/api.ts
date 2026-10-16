@@ -18,9 +18,22 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   let response: Response;
   try { response = await fetch(API_URL + path, { ...init, headers, cache: "no-store" }); }
   catch { throw new ApiError("Could not reach the API through the local frontend. Keep the backend running at http://127.0.0.1:8000 and restart the frontend after changing its environment settings.", 0); }
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new ApiError(payload.detail || "The request could not be completed.", response.status);
-  return payload as T;
+  const responseText = await response.text();
+  let payloadData: unknown = {};
+  let payload: { detail?: unknown } = {};
+  try {
+    payloadData = responseText ? JSON.parse(responseText) : {};
+    payload = payloadData as { detail?: unknown };
+  }
+  catch { /* Non-JSON proxy/server errors are reported with their HTTP status below. */ }
+  if (!response.ok) {
+    const detail = typeof payload.detail === "string"
+      ? payload.detail
+      : payload.detail === undefined ? "" : JSON.stringify(payload.detail);
+    const message = detail || `API returned HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}. Check the backend terminal for its error details.`;
+    throw new ApiError(message, response.status);
+  }
+  return payloadData as T;
 }
 
 export async function signIn(email: string, password: string, mode: "login" | "register") {
