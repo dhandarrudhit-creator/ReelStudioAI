@@ -2,9 +2,9 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "AI Video Studio — Make every lesson shareable",
+  title: "Reel Studio AI — A studio for the moments that matter",
   description:
-    "Turn educational recordings into short videos and create explainers from a topic prompt.",
+    "Turn educational recordings into short, captioned vertical reels with local-first AI processing.",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

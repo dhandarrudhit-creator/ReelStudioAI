@@ -1,203 +1,95 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { ChangeEvent, DragEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import Link from "next/link";
+import { api, ApiError, getMe, getVideos, API_URL, TOKEN_KEY, formatTime } from "@/lib/api";
+import type { Export, User, VideoProject } from "@/lib/types";
 
-type ConnectionState = "checking" | "connected" | "disconnected";
+type View="overview"|"projects"|"exports"|"brand";
+const ACCEPT=".mp4,.mov,.m4v,.webm,.mkv";
 
-const apiBaseUrl = (
-  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000"
-).replace(/\/$/, "");
+export default function Dashboard() {
+  const router=useRouter(); const input=useRef<HTMLInputElement>(null);
+  const [user,setUser]=useState<User|null>(null); const [videos,setVideos]=useState<VideoProject[]>([]); const [exports,setExports]=useState<Export[]>([]);
+  const [view,setView]=useState<View>("overview"); const [loading,setLoading]=useState(true); const [error,setError]=useState("");
+  const [uploadOpen,setUploadOpen]=useState(false); const [dragging,setDragging]=useState(false); const [uploadBusy,setUploadBusy]=useState(false); const [uploadMessage,setUploadMessage]=useState(""); const [brand,setBrand]=useState("");const [accent,setAccent]=useState("#ab94ff");
+  const refresh=useCallback(async()=>{
+    try { const [me,projects]=await Promise.all([getMe(),getVideos()]); setUser(me); setVideos(projects); setError("");
+      const all=await Promise.all(projects.map(p=>api<VideoProject & {exports:Export[]}>(`/api/videos/${p.id}`).catch(()=>null)));
+      setExports(all.flatMap(item=>item?.exports?.map(e=>({...e,clip_title:e.clip_title||"Rendered reel",video_name:item.name}))||[]));
+    } catch(e) { if(e instanceof ApiError && e.status===401){localStorage.removeItem(TOKEN_KEY);router.replace("/login")} else setError(e instanceof Error?e.message:"Could not load your workspace."); }
+    finally {setLoading(false)}
+  },[router]);
+  useEffect(()=>{if(!localStorage.getItem(TOKEN_KEY)){router.replace("/login");return}const start=window.setTimeout(()=>{void refresh();setBrand(localStorage.getItem("reel-studio-brand")||"");setAccent(localStorage.getItem("reel-studio-accent")||"#ab94ff");if(new URLSearchParams(window.location.search).get("section")==="brand")setView("brand")},0);return()=>window.clearTimeout(start)},[refresh,router]);
+  const stats=useMemo(()=>({projects:videos.length,clips:videos.reduce((n,v)=>n+v.clip_count,0),exports:videos.reduce((n,v)=>n+v.export_count,0)}),[videos]);
 
-function SparkIcon() {
-  return (
-    <svg aria-hidden="true" viewBox="0 0 24 24" fill="none">
-      <path d="m12 2 1.8 7.2L21 11l-7.2 1.8L12 20l-1.8-7.2L3 11l7.2-1.8L12 2Z" />
-      <path d="m19 15 .9 2.1L22 18l-2.1.9L19 21l-.9-2.1L16 18l2.1-.9L19 15Z" />
-    </svg>
-  );
-}
-
-function FilmIcon() {
-  return (
-    <svg aria-hidden="true" viewBox="0 0 24 24" fill="none">
-      <rect x="3" y="4" width="18" height="16" rx="3" />
-      <path d="M7 4v16M17 4v16M3 9h4m-4 6h4m10-6h4m-4 6h4" />
-    </svg>
-  );
-}
-
-function CodeIcon() {
-  return (
-    <svg aria-hidden="true" viewBox="0 0 24 24" fill="none">
-      <path d="m8 8-4 4 4 4m8-8 4 4-4 4m-3-10-2 12" />
-    </svg>
-  );
-}
-
-async function requestBackendStatus(signal?: AbortSignal): Promise<boolean> {
-  try {
-    const response = await fetch(apiBaseUrl + "/api/health", {
-      cache: "no-store",
-      signal: signal ?? AbortSignal.timeout(5000),
-    });
-    if (!response.ok) return false;
-    const result: { status?: string } = await response.json();
-    return result.status === "ok";
-  } catch {
-    return false;
+  async function upload(file?:File){
+    if(!file)return; setUploadMessage(""); const ext="."+file.name.split(".").pop()?.toLowerCase();
+    if(![".mp4",".mov",".m4v",".webm",".mkv"].includes(ext)){setUploadMessage("Choose an MP4, MOV, M4V, WebM, or MKV video.");return}
+    if(file.size>500*1024*1024){setUploadMessage("This file is larger than the 500 MB local upload limit.");return}
+    setUploadBusy(true);setUploadMessage("Uploading and checking your video…");
+    try {const body=new FormData();body.append("file",file);const project=await api<VideoProject>("/api/videos",{method:"POST",body});
+      setUploadMessage("Starting local transcription…");await api(`/api/videos/${project.id}/process`,{method:"POST"});setUploadOpen(false);router.push(`/studio/${project.id}`);
+    }catch(e){setUploadMessage(e instanceof Error?e.message:"Upload failed.")}finally{setUploadBusy(false)}
   }
-}
+  function fileChange(e:ChangeEvent<HTMLInputElement>){void upload(e.target.files?.[0]);e.target.value=""}
+  function drop(e:DragEvent<HTMLDivElement>){e.preventDefault();setDragging(false);void upload(e.dataTransfer.files?.[0])}
+  function logout(){localStorage.removeItem(TOKEN_KEY);router.replace("/login")}
 
-function BackendStatus() {
-  const [state, setState] = useState<ConnectionState>("checking");
-
-  const checkBackend = useCallback(async () => {
-    setState("checking");
-    const isConnected = await requestBackendStatus();
-    setState(isConnected ? "connected" : "disconnected");
-  }, []);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    void requestBackendStatus(controller.signal).then((isConnected) => {
-      if (!controller.signal.aborted) {
-        setState(isConnected ? "connected" : "disconnected");
-      }
-    });
-    return () => controller.abort();
-  }, []);
-
-  const label = {
-    checking: "Checking connection",
-    connected: "Backend connected",
-    disconnected: "Backend offline",
-  }[state];
-
-  return (
-    <div className={"backend-status backend-status--" + state} aria-live="polite">
-      <span className="status-dot" />
-      <span>{label}</span>
-      {state !== "checking" && (
-        <button
-          className="status-retry"
-          onClick={() => void checkBackend()}
-          type="button"
-          aria-label="Check backend connection again"
-        >
-          Retry
-        </button>
-      )}
-    </div>
-  );
-}
-
-const workflowCards = [
-  {
-    number: "01",
-    title: "Lecture to Shorts",
-    description:
-      "Find the clearest teaching moments in a class recording and shape them into ready-to-share vertical clips.",
-    icon: FilmIcon,
-    tags: ["Smart highlights", "Word-level captions"],
-    className: "workflow-card--violet",
-  },
-  {
-    number: "02",
-    title: "Topic to Explainer",
-    description:
-      "Turn a topic into a concise lesson with a script, animated code, voiceover, and captions.",
-    icon: CodeIcon,
-    tags: ["AI-written script", "Animated code"],
-    className: "workflow-card--peach",
-  },
-];
-
-export default function Home() {
-  return (
-    <main className="studio-shell">
-      <header className="topbar">
-        <a className="brand" href="#top" aria-label="AI Video Studio home">
-          <span className="brand-mark"><SparkIcon /></span>
-          <span>AI Video <span className="brand-accent">Studio</span></span>
-        </a>
-        <div className="topbar-right">
-          <span className="topbar-label">Your creative workspace</span>
-          <BackendStatus />
-        </div>
-      </header>
-
-      <section className="hero" id="top" aria-labelledby="hero-title">
-        <div className="hero-copy">
-          <div className="eyebrow"><span className="eyebrow-line" /> MADE FOR EDUCATORS</div>
-          <h1 id="hero-title">Make every lesson<br /><span>a moment worth sharing.</span></h1>
-          <p className="hero-description">
-            Turn the best of your teaching into short videos students want to watch.
-            Start with a class recording or bring a topic to life.
-          </p>
-          <a className="scroll-cue" href="#workflows">
-            <span className="scroll-cue-icon">↓</span> Choose your starting point
-          </a>
-        </div>
-
-        <div className="hero-art" aria-label="A preview of a vertical lesson video">
-          <div className="art-orbit art-orbit--outer" />
-          <div className="art-orbit art-orbit--inner" />
-          <div className="art-spark art-spark--one">✳</div>
-          <div className="art-spark art-spark--two">✦</div>
-          <div className="preview-card">
-            <div className="preview-topline"><span>LESSON PREVIEW</span><span className="preview-live"><i /> READY</span></div>
-            <div className="preview-screen">
-              <div className="screen-window">
-                <div className="screen-window-bar"><i /><i /><i /><span>useEffect.tsx</span></div>
-                <div className="code-lines" aria-hidden="true">
-                  <span><b>1</b><em>useEffect</em>(() =&gt; {"{"}</span>
-                  <span><b>2</b>  <strong>const</strong> data = fetchData();</span>
-                  <span><b>3</b>  setResult(data);</span>
-                  <span><b>4</b>{"}"}, []);</span>
-                </div>
-                <span className="cursor-dot" />
-              </div>
-              <div className="video-caption">Think of it as a side effect ✨</div>
-              <div className="preview-watermark">LESSON<br />SNIPPET</div>
-            </div>
-            <div className="preview-controls"><span>▶</span><div className="preview-track"><i /></div><span>00:18</span><span className="preview-volume">◖</span></div>
-          </div>
-          <div className="floating-note"><span className="note-icon">✦</span><span><b>One clear idea.</b><small>Ready for your feed.</small></span></div>
-        </div>
-      </section>
-
-      <section className="workflows" id="workflows" aria-labelledby="workflows-title">
-        <div className="section-heading">
-          <div>
-            <div className="eyebrow"><span className="eyebrow-line" /> TWO WAYS TO CREATE</div>
-            <h2 id="workflows-title">Where should we start?</h2>
-          </div>
-          <p>Pick a workflow. We’ll help you turn good teaching into great video.</p>
-        </div>
-
-        <div className="workflow-grid">
-          {workflowCards.map((workflow) => {
-            const Icon = workflow.icon;
-            return (
-              <article className={"workflow-card " + workflow.className} key={workflow.title}>
-                <div className="card-top"><span className="card-number">{workflow.number} / WORKFLOW</span><span className="card-icon"><Icon /></span></div>
-                <h3>{workflow.title}</h3>
-                <p>{workflow.description}</p>
-                <div className="card-bottom">
-                  <div className="card-tags">{workflow.tags.map((tag) => <span key={tag}>{tag}</span>)}</div>
-                  <span className="coming-soon">COMING SOON</span>
-                </div>
-              </article>
-            );
-          })}
-        </div>
-      </section>
-
-      <footer className="footer">
-        <span className="footer-brand"><span className="brand-mark brand-mark--small"><SparkIcon /></span> AI Video Studio</span>
-        <span>Built for the next generation of learning.</span>
-        <span className="footer-version">FOUNDATION · PHASE 1</span>
-      </footer>
+  return <div className="app-shell">
+    <aside className="sidebar">
+      <Link className="brand sidebar-brand" href="/"><span className="brand-symbol"><Mark/></span><span>reel<span className="brand-lilac">studio</span></span></Link>
+      <div className="workspace-switch"><span className="workspace-avatar">{user?.email?.[0]?.toUpperCase()||"R"}</span><span className="workspace-copy"><b>My workspace</b><small>Local studio</small></span><svg viewBox="0 0 20 20"><path d="m6 8 4 4 4-4"/></svg></div>
+      <div className="nav-caption">WORKSPACE</div><nav className="side-nav" aria-label="Main navigation">
+        <NavButton active={view==="overview"} onClick={()=>setView("overview")} icon="home">Overview</NavButton>
+        <NavButton active={view==="projects"} onClick={()=>setView("projects")} icon="film">My projects <span className="nav-count">{stats.projects}</span></NavButton>
+        <NavButton active={view==="exports"} onClick={()=>setView("exports")} icon="download">Export library</NavButton>
+      </nav>
+      <div className="nav-caption nav-caption-lower">PUBLISHING</div><nav className="side-nav"><Link className="nav-link" href="/publishing"><Icon name="film"/><span>Calendar &amp; queue</span></Link></nav>
+      <div className="nav-caption nav-caption-lower">PREFERENCES</div><nav className="side-nav"><NavButton active={view==="brand"} onClick={()=>setView("brand")} icon="sliders">Brand settings</NavButton></nav>
+      <div className="sidebar-spacer"/><div className="storage-note"><span className="storage-icon"><Icon name="shield"/></span><div><b>Private by default</b><p>Your videos stay in local storage on this machine.</p></div></div>
+      <button className="user-menu" onClick={logout}><span className="user-avatar">{user?.email?.[0]?.toUpperCase()||"U"}</span><span className="user-meta"><b>{user?.email||"Loading account"}</b><small>Local account</small></span><span className="logout-icon"><Icon name="logout"/></span></button>
+    </aside>
+    <main className="main-content">
+      <header className="page-topbar"><div className="breadcrumbs"><span>Workspace</span><i>/</i><b>{viewLabel(view)}</b></div><div className="topbar-actions"><span className="local-pill"><i/> LOCAL MODE</span><button className="icon-button" title="Refresh projects" onClick={()=>void refresh()}><Icon name="refresh"/></button><button className="user-avatar top-avatar" onClick={logout} aria-label="Sign out">{user?.email?.[0]?.toUpperCase()||"U"}</button></div></header>
+      {error&&<div className="notice notice-error" role="alert"><Icon name="alert"/>{error}<button onClick={()=>void refresh()}>Retry</button></div>}
+      {loading?<div className="loading-state"><span className="spinner"/> Loading your workspace…</div>:<>
+        {view==="overview"&&<>
+          <section className="welcome-row"><div><div className="eyebrow"><i/> YOUR CREATIVE WORKSPACE</div><h1>Make a moment <em>matter.</em></h1><p>Find the moments that make a lesson stick, then shape them into a reel.</p></div><button className="button button-primary" onClick={()=>setUploadOpen(true)}><Icon name="plus"/> New project</button></section>
+          <section className="stat-grid" aria-label="Workspace summary"><Stat label="Projects created" value={stats.projects} icon="film"/><Stat label="Highlights found" value={stats.clips} icon="spark"/><Stat label="Reels exported" value={stats.exports} icon="download"/><div className="stat-card stat-card-tip"><span className="tip-mark"><Icon name="spark"/></span><div><b>One idea at a time.</b><p>Keep clips focused on one clear teaching moment.</p></div></div></section>
+          <section className="section-block" id="projects"><div className="section-title"><div><span className="section-kicker">YOUR RECENT WORK</span><h2>Projects</h2></div><button className="text-button" onClick={()=>setView("projects")}>View all <span>→</span></button></div>
+            {videos.length?<div className="project-grid">{videos.slice(0,4).map(v=><ProjectCard key={v.id} project={v} onClick={()=>router.push(`/studio/${v.id}`)}/>)}</div>:<EmptyProjects onUpload={()=>setUploadOpen(true)}/>}
+          </section>
+          <section className="bottom-grid"><div className="panel-card journey-card"><div className="section-title"><div><span className="section-kicker">A SIMPLE FLOW</span><h2>From class to clip</h2></div><span className="journey-step-count">3 STEPS</span></div><div className="journey-steps"><JourneyStep n="01" title="Bring your recording" text="Upload a short lesson from your computer."/><i className="journey-connector"/><JourneyStep n="02" title="Find the good bit" text="Review transcript-based highlight suggestions."/><i className="journey-connector"/><JourneyStep n="03" title="Shape and share" text="Adjust, caption, and export a vertical reel."/></div></div>
+            <div className="panel-card exports-card"><div className="section-title"><div><span className="section-kicker">READY TO WATCH</span><h2>Recent exports</h2></div><button className="text-button" onClick={()=>setView("exports")}>Library <span>→</span></button></div>{exports.filter(e=>e.status==="ready").slice(0,2).length?exports.filter(e=>e.status==="ready").slice(0,2).map(e=><ExportRow key={e.id} item={e}/>):<div className="small-empty"><span className="empty-file"><Icon name="file"/></span><p>Your finished reels will appear here.</p></div>}</div></section>
+        </>}
+        {view==="projects"&&<section className="subpage"><div className="welcome-row compact"><div><div className="eyebrow"><i/> YOUR HISTORY</div><h1>All projects</h1><p>Every uploaded lesson and its processing history, saved to this workspace.</p></div><button className="button button-primary" onClick={()=>setUploadOpen(true)}><Icon name="plus"/> New project</button></div>{videos.length?<div className="project-grid">{videos.map(v=><ProjectCard key={v.id} project={v} onClick={()=>router.push(`/studio/${v.id}`)}/>)}</div>:<EmptyProjects onUpload={()=>setUploadOpen(true)}/>}</section>}
+        {view==="exports"&&<section className="subpage"><div className="welcome-row compact"><div><div className="eyebrow"><i/> YOUR FINISHED REELS</div><h1>Export library</h1><p>Play or download reels rendered from your lesson recordings.</p></div></div>{exports.length?<div className="export-list">{exports.map(e=><ExportRow key={e.id} item={e}/>)}</div>:<div className="panel-card big-empty"><span className="empty-file"><Icon name="file"/></span><h3>No exports yet</h3><p>Once you render a reel, you’ll find it here with its download link.</p></div>}</section>}
+        {view==="brand"&&<section className="subpage" id="brand"><div className="welcome-row compact"><div><div className="eyebrow"><i/> PERSONALIZE YOUR REELS</div><h1>Brand settings</h1><p>Set the institute name and accent used on your next render.</p></div></div><BrandSettings brand={brand} accent={accent} onSave={(v,color)=>{setBrand(v);setAccent(color);localStorage.setItem("reel-studio-brand",v);localStorage.setItem("reel-studio-accent",color)}}/></section>}
+      </>}
+      <footer className="app-footer"><span>REEL STUDIO AI</span><span>Local-first video workspace <i/> Processing runs on this machine</span></footer>
     </main>
-  );
+    {uploadOpen&&<div className="modal-scrim" onMouseDown={e=>{if(e.target===e.currentTarget&&!uploadBusy)setUploadOpen(false)}}><section className="upload-modal" role="dialog" aria-modal="true" aria-labelledby="upload-title"><div className="modal-heading"><div><span className="section-kicker">START SOMETHING NEW</span><h2 id="upload-title">Upload a lesson</h2><p>We’ll transcribe it locally and suggest short teaching highlights.</p></div><button className="icon-button" onClick={()=>setUploadOpen(false)} aria-label="Close upload" disabled={uploadBusy}><Icon name="close"/></button></div>
+        <div className={"dropzone "+(dragging?"dropzone-active":"")} onDragOver={e=>{e.preventDefault();setDragging(true)}} onDragLeave={()=>setDragging(false)} onDrop={drop} onClick={()=>!uploadBusy&&input.current?.click()} role="button" tabIndex={0} onKeyDown={e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();input.current?.click()}}}><input ref={input} type="file" accept={ACCEPT} onChange={fileChange} hidden/><span className="upload-icon"><Icon name="upload"/></span><b>Drop your video here or <em>browse files</em></b><small>MP4, MOV, M4V, WebM, MKV <i/> Up to 500 MB</small></div>
+        <div className="upload-requirements"><span><Icon name="shield"/> File stays on this computer</span><span><Icon name="cpu"/> Local transcription</span></div>{uploadMessage&&<div className={"upload-message "+(uploadBusy?"":"upload-message-error")} role="status">{uploadBusy&&<span className="spinner"/>}{uploadMessage}</div>}
+        <div className="modal-actions"><button className="button button-quiet" disabled={uploadBusy} onClick={()=>setUploadOpen(false)}>Cancel</button><button className="button button-primary" disabled={uploadBusy} onClick={()=>input.current?.click()}>{uploadBusy?"Working…":"Choose a video"}<Icon name="arrow"/></button></div>
+      </section></div>}
+  </div>;
 }
+
+function viewLabel(view:View){return {overview:"Overview",projects:"My projects",exports:"Export library",brand:"Brand settings"}[view]}
+function NavButton({active,onClick,icon,children}:{active:boolean;onClick:()=>void;icon:IconName;children:React.ReactNode}){return <button className={"nav-link "+(active?"nav-link-active":"")} onClick={onClick}><Icon name={icon}/><span>{children}</span>{active&&<i className="nav-active-bar"/>}</button>}
+function Stat({label,value,icon}:{label:string;value:number;icon:IconName}){return <div className="stat-card"><span className="stat-icon"><Icon name={icon}/></span><div><b>{value}</b><small>{label}</small></div><span className="stat-sparkline" aria-hidden="true">···</span></div>}
+function ProjectCard({project,onClick}:{project:VideoProject;onClick:()=>void}){const status=project.status;return <button className="project-card" onClick={onClick}><div className="project-thumb"><span className="thumb-grid"/><span className="thumb-play"><Icon name="play"/></span><span className="thumb-duration">{formatTime(project.duration||0)}</span><span className="thumb-ratio">{project.width&&project.height?`${project.width} × ${project.height}`:"VIDEO"}</span></div><div className="project-info"><div className="project-title-row"><b title={project.name}>{project.name}</b><span className={"status-chip status-"+status}><i/>{statusLabel(status)}</span></div><div className="project-meta"><span>{new Date(project.created_at).toLocaleDateString(undefined,{month:"short",day:"numeric",year:"numeric"})}</span><span>·</span><span>{project.clip_count} {project.clip_count===1?"highlight":"highlights"}</span><span className="project-open">Open <b>→</b></span></div>{project.status==="failed"&&project.error&&<p className="project-error">{project.error}</p>}</div></button>}
+function statusLabel(status:string){return {uploaded:"Uploaded",processing:"Processing",ready:"Ready",failed:"Needs attention"}[status]||status}
+function EmptyProjects({onUpload}:{onUpload:()=>void}){return <div className="panel-card big-empty"><span className="empty-file"><Icon name="film"/></span><h3>Your first lesson starts here.</h3><p>Upload a short recording and Reel Studio will find moments worth sharing.</p><button className="button button-primary" onClick={onUpload}><Icon name="plus"/> Upload a video</button></div>}
+function JourneyStep({n,title,text}:{n:string;title:string;text:string}){return <div className="journey-step"><span>{n}</span><b>{title}</b><p>{text}</p></div>}
+function ExportRow({item}:{item:Export}){const [message,setMessage]=useState("");const [mediaUrl,setMediaUrl]=useState("");useEffect(()=>()=>{if(mediaUrl)URL.revokeObjectURL(mediaUrl)},[mediaUrl]);async function getMedia(){const token=localStorage.getItem(TOKEN_KEY);const response=await fetch(API_URL+`/api/exports/${item.id}/download`,{headers:token?{Authorization:`Bearer ${token}`}:{}});if(!response.ok)throw new Error("This file is missing. Re-render it from the project.");return URL.createObjectURL(await response.blob())}async function media(){try{setMessage("");setMediaUrl(await getMedia())}catch(e){setMessage(e instanceof Error?e.message:"Playback unavailable.")}}async function download(){try{const url=mediaUrl||await getMedia();if(!mediaUrl)setMediaUrl(url);const a=document.createElement("a");a.href=url;a.download=`${item.clip_title||"lesson-reel"}.mp4`;a.click()}catch(e){setMessage(e instanceof Error?e.message:"Download unavailable.")}}
+return <><div className="export-row"><button className="export-preview" title="Play export" onClick={()=>{if(mediaUrl)setMediaUrl("");else void media()}} disabled={item.status!=="ready"}><Icon name="play"/></button><span className="export-copy"><b>{item.clip_title||"Rendered reel"}</b><small>{item.video_name} <i/> {item.status==="ready"?"MP4 · 9:16":item.status}</small>{item.error&&<small className="download-error">{item.error}</small>}{item.metadata&&item.metadata.quality_warnings&&item.metadata.quality_warnings.length>0&&<small className="quality-note">Quality check: {item.metadata.quality_warnings.join(" · ")}</small>}{message&&<small className="download-error">{message}</small>}</span><span className={"export-status export-"+item.status}><i/>{item.status}</span>{item.status==="ready"&&<button className="icon-button download-button" title="Download video" onClick={()=>void download()}><Icon name="download"/></button>}</div>{mediaUrl&&<div className="export-player"><video controls autoPlay playsInline src={mediaUrl} aria-label={`Play ${item.clip_title||"exported reel"}`}/><button className="text-button" onClick={()=>setMediaUrl("")}>Close preview ×</button></div>}</>}
+
+function BrandSettings({brand,accent,onSave}:{brand:string;accent:string;onSave:(value:string,color:string)=>void}){const [value,setValue]=useState(brand);const [color,setColor]=useState(accent);const [saved,setSaved]=useState(false);return <div className="panel-card brand-panel"><div className="brand-panel-head"><span className="brand-preview-icon"><Icon name="spark"/></span><div><h2>Institute identity</h2><p>Add a name and accent color to your finished reels. The name appears as a small watermark near the bottom.</p></div></div><label className="settings-label">Institute or channel name<input value={value} onChange={e=>{setValue(e.target.value);setSaved(false)}} maxLength={48} placeholder="e.g. Northstar Learning"/><small>Up to 48 characters · saved in this browser</small></label><label className="accent-control">Watermark accent<input type="color" value={color} onChange={e=>{setColor(e.target.value);setSaved(false)}}/><span>{color.toUpperCase()}</span></label><div className="brand-preview-card"><div className="eyebrow">PREVIEW</div><div className="fake-reel"><span className="fake-caption">A lesson worth sharing</span><span className="fake-watermark" style={{color}}>{value||"Your institute"}</span></div></div><button className="button button-primary" onClick={()=>{onSave(value.trim(),color);setSaved(true)}}>{saved?"Saved":"Save brand settings"}<Icon name={saved?"check":"arrow"}/></button></div>}
+
+type IconName="home"|"film"|"download"|"sliders"|"shield"|"logout"|"refresh"|"alert"|"plus"|"spark"|"play"|"file"|"close"|"upload"|"cpu"|"arrow"|"check";
+function Icon({name}:{name:IconName}){const p:Record<IconName,React.ReactNode>={home:<><path d="m3 10 9-7 9 7"/><path d="M5 9v11h14V9M9 20v-7h6v7"/></>,film:<><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M7 4v16M17 4v16M3 9h4m-4 6h4m10-6h4m-4 6h4"/></>,download:<><path d="M12 3v12m-5-5 5 5 5-5"/><path d="M4 17v3h16v-3"/></>,sliders:<><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="8" cy="6" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="10" cy="18" r="2"/></>,shield:<><path d="M12 22s8-4 8-11V5l-8-3-8 3v6c0 7 8 11 8 11Z"/><path d="m9 12 2 2 4-4"/></>,logout:<><path d="M10 17l5-5-5-5m5 5H3"/><path d="M12 3h7a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-7"/></>,refresh:<><path d="M20 7v5h-5M4 17v-5h5"/><path d="M5.6 9a7 7 0 0 1 11.6-2L20 12M4 12l2.8 5a7 7 0 0 0 11.6-2"/></>,alert:<><circle cx="12" cy="12" r="9"/><path d="M12 8v5m0 3h.01"/></>,plus:<path d="M12 5v14m-7-7h14"/>,spark:<><path d="m12 3 1.7 6.3L20 11l-6.3 1.7L12 19l-1.7-6.3L4 11l6.3-1.7L12 3Z"/><path d="m19 15 .7 2.3L22 18l-2.3.7L19 21l-.7-2.3L16 18l2.3-.7L19 15Z"/></>,play:<path d="m9 6 9 6-9 6V6Z"/>,file:<><path d="M13 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V10Z"/><path d="M13 3v7h7"/></>,close:<path d="m6 6 12 12M18 6 6 18"/>,upload:<><path d="M12 16V4m-5 5 5-5 5 5"/><path d="M4 16v4h16v-4"/></>,cpu:<><rect x="5" y="5" width="14" height="14" rx="2"/><path d="M9 9h6v6H9zM9 1v4m6-4v4m-6 14v4m6-4v4M1 9h4m-4 6h4m14-6h4m-4 6h4"/></>,arrow:<path d="M4 12h15m-6-6 6 6-6 6"/>,check:<path d="m5 12 4 4L19 6"/>};return <svg className="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{p[name]}</svg>}
+function Mark(){return <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 4.5h12A2.5 2.5 0 0 1 20.5 7v10a2.5 2.5 0 0 1-2.5 2.5H6A2.5 2.5 0 0 1 3.5 17V7A2.5 2.5 0 0 1 6 4.5Z"/><path d="m10 8.5 5.5 3.5-5.5 3.5v-7Z"/></svg>}

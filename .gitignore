@@ -1,12 +1,16 @@
 # Node.js / Next.js
 node_modules/
 .next/
+frontend/.next-validation*/
+frontend/.next-offload-build/
 out/
 frontend/.env.local
 
 # Python
 __pycache__/
 *.py[cod]
+**/.pytest_cache/
+backend/.pytest-run*/
 backend/.venv/
 backend/.env
 
