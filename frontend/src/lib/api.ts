@@ -1,6 +1,8 @@
 import type { Clip, Export, Job, User, VideoProject } from "./types";
 
-export const API_URL = (process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
+// Requests go through Next.js so the browser only talks to its own origin.
+// Configure the server-side API_PROXY_TARGET in next.config.ts when needed.
+export const API_URL = (process.env.NEXT_PUBLIC_API_BASE_URL || "/backend-api").replace(/\/$/, "");
 export const TOKEN_KEY = "reel-studio-token";
 
 export class ApiError extends Error {
@@ -15,7 +17,7 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (init.body && !(init.body instanceof FormData)) headers.set("Content-Type", "application/json");
   let response: Response;
   try { response = await fetch(API_URL + path, { ...init, headers, cache: "no-store" }); }
-  catch { throw new ApiError("Could not reach the local API. Check that the backend is running.", 0); }
+  catch { throw new ApiError("Could not reach the API through the local frontend. Keep the backend running at http://127.0.0.1:8000 and restart the frontend after changing its environment settings.", 0); }
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) throw new ApiError(payload.detail || "The request could not be completed.", response.status);
   return payload as T;

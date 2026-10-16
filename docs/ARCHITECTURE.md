@@ -2,7 +2,7 @@
 
 ## Local-first system
 
-The Next.js app runs in the browser and calls the FastAPI service at `NEXT_PUBLIC_API_BASE_URL`. FastAPI owns authentication, validation, media processing, SQLite persistence, and file downloads. Local SQLite and files under `storage/` are the source of truth.
+The Next.js app runs in the browser and sends API calls to its same-origin `/backend-api` path. Next.js proxies those requests to FastAPI using the server-only `API_PROXY_TARGET` setting, avoiding browser CORS and loopback-host mismatches. FastAPI owns authentication, validation, media processing, SQLite persistence, and file downloads. Local SQLite and files under `storage/` are the source of truth.
 
 ```text
 Browser / Next.js

@@ -14,6 +14,12 @@ const nextConfig: NextConfig = {
       },
     },
   },
+  // Keep browser requests same-origin. Next.js proxies API calls to FastAPI,
+  // avoiding localhost/127.0.0.1 mismatches and browser CORS failures.
+  async rewrites() {
+    const apiOrigin = (process.env.API_PROXY_TARGET || "http://127.0.0.1:8000").replace(/\/$/, "");
+    return [{ source: "/backend-api/:path*", destination: `${apiOrigin}/:path*` }];
+  },
 };
 
 export default nextConfig;

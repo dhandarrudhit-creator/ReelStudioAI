@@ -194,8 +194,11 @@ The core tests cover password hashing and transcript highlight grouping. A real 
 `frontend/.env.local`:
 
 ```dotenv
-NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8000
+NEXT_PUBLIC_API_BASE_URL=/backend-api
+API_PROXY_TARGET=http://127.0.0.1:8000
 ```
+
+The browser sends API calls to the Next.js app on the same origin. Next.js then proxies `/backend-api/*` requests to FastAPI, which avoids browser CORS and `localhost` versus `127.0.0.1` differences. If FastAPI uses another address, change `API_PROXY_TARGET` and restart Next.js.
 
 Never put tokens, passwords, or private keys in `NEXT_PUBLIC_*` variables. The browser stores the signed local access token in local storage; sign out to remove it.
 
