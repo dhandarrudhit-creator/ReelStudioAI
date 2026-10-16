@@ -1,0 +1,3 @@
+# Optional local transcription. Install this after the core API requirements.
+# The first transcription downloads the model weights into DATA_DIR/models.
+faster-whisper>=1.1,<2.0
