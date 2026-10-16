@@ -58,6 +58,7 @@ Open a **second** PowerShell terminal in the project folder and run:
 
 ~~~powershell
 cd frontend
+npm install
 Copy-Item .env.example .env.local
 npm run dev
 ~~~
