@@ -1,2 +1,0 @@
-# Optional face tracking for smart crop; center-crop fallback works without it.
-opencv-python-headless>=4.10,<5
