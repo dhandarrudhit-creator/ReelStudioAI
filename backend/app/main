@@ -1,0 +1,336 @@
+from __future__ import annotations
+import os, shutil, sqlite3, subprocess, uuid, json, threading, time
+from pathlib import Path
+from datetime import datetime, timezone
+from typing import Optional
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Header
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel, Field
+
+ROOT = Path(__file__).resolve().parents[1]
+DATA = Path(os.getenv('REELSTUDIO_DATA_DIR', str(ROOT / 'data'))).resolve()
+UPLOADS, RENDERS = DATA/'uploads', DATA/'renders'
+for p in (UPLOADS, RENDERS): p.mkdir(parents=True, exist_ok=True)
+DB = DATA/'reelstudio.sqlite3'
+MAX_UPLOAD = int(os.getenv('MAX_UPLOAD_MB','1024')) * 1024 * 1024
+ALLOWED = {'.mp4','.mov','.mkv','.webm','.avi','.mp3','.wav','.m4a'}
+
+def connect():
+    c=sqlite3.connect(DB, timeout=30); c.row_factory=sqlite3.Row; return c
+
+def init_db():
+    with connect() as c:
+        c.executescript('''
+        CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,email TEXT UNIQUE,password TEXT,created_at TEXT);
+        CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,title TEXT,filename TEXT,path TEXT,duration REAL,width INTEGER,height INTEGER,has_audio INTEGER,status TEXT,created_at TEXT);
+        CREATE TABLE IF NOT EXISTS transcripts(id TEXT PRIMARY KEY,project_id TEXT,language TEXT,segments TEXT,created_at TEXT);
+        CREATE TABLE IF NOT EXISTS clips(id TEXT PRIMARY KEY,project_id TEXT,start REAL,end REAL,title TEXT,score REAL,reasons TEXT,context_warning INTEGER,status TEXT,created_at TEXT);
+        CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,type TEXT,target_id TEXT,status TEXT,progress INTEGER,message TEXT,error TEXT,created_at TEXT,updated_at TEXT);
+        CREATE TABLE IF NOT EXISTS exports(id TEXT PRIMARY KEY,clip_id TEXT,project_id TEXT,path TEXT,width INTEGER,height INTEGER,duration REAL,status TEXT,validation_report TEXT,created_at TEXT);
+        ''')
+
+def now(): return datetime.now(timezone.utc).isoformat()
+def rowdict(r): return dict(r) if r else None
+
+def tool(name): return shutil.which(name)
+def probe(path: Path):
+    ffprobe=tool('ffprobe')
+    if not ffprobe: raise HTTPException(503, 'FFprobe is not installed. Install FFmpeg and ensure ffprobe is on PATH.')
+    try:
+        raw=subprocess.run([ffprobe,'-v','error','-show_streams','-show_format','-of','json',str(path)],capture_output=True,text=True,timeout=45,check=True)
+        d=json.loads(raw.stdout); streams=d.get('streams',[]); v=next((s for s in streams if s.get('codec_type')=='video'),{})
+        a=next((s for s in streams if s.get('codec_type')=='audio'),{})
+        return {'duration':float(d.get('format',{}).get('duration') or 0),'width':int(v.get('width') or 0),'height':int(v.get('height') or 0),'has_audio':bool(a),'has_video':bool(v)}
+    except (subprocess.SubprocessError,ValueError,KeyError) as e: raise HTTPException(400, f'Could not read media file: {e}')
+
+def get_project(pid):
+    with connect() as c: r=c.execute('SELECT * FROM projects WHERE id=?',(pid,)).fetchone()
+    if not r: raise HTTPException(404,'Project not found')
+    return rowdict(r)
+def get_clip(cid):
+    with connect() as c: r=c.execute('SELECT * FROM clips WHERE id=?',(cid,)).fetchone()
+    if not r: raise HTTPException(404,'Clip not found')
+    return rowdict(r)
+def create_job(kind,target):
+    jid=str(uuid.uuid4()); t=now()
+    with connect() as c: c.execute('INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?,?)',(jid,kind,target,'queued',0,'Queued',None,t,t))
+    return {'id':jid,'job_id':jid,'type':kind,'target_id':target,'status':'queued','progress':0,'message':'Queued'}
+def update_job(jid,status,progress,message,error=None):
+    with connect() as c: c.execute('UPDATE jobs SET status=?,progress=?,message=?,error=?,updated_at=? WHERE id=?',(status,progress,message,error,now(),jid))
+def run_transcribe(jid,pid):
+    try:
+        update_job(jid,'running',5,'Preparing audio')
+        p=get_project(pid)
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            raise RuntimeError('Whisper is not installed yet. Run pip install -r requirements-whisper.txt and retry.')
+        ffmpeg=tool('ffmpeg')
+        if not ffmpeg: raise RuntimeError('FFmpeg is not installed or not on PATH.')
+        audio=DATA/'audio'/f'{pid}.wav'; audio.parent.mkdir(parents=True,exist_ok=True)
+        subprocess.run([ffmpeg,'-y','-i',p['path'],'-vn','-ac','1','-ar','16000',str(audio)],capture_output=True,timeout=300,check=True)
+        update_job(jid,'running',20,'Transcribing audio with local Whisper')
+        model=WhisperModel(os.getenv('WHISPER_MODEL','base'),device=os.getenv('WHISPER_DEVICE','cpu'),compute_type=os.getenv('WHISPER_COMPUTE_TYPE','int8'))
+        segments, info=model.transcribe(str(audio),word_timestamps=True, vad_filter=True)
+        out=[]
+        for s in segments:
+            words=[]
+            for w in (s.words or []): words.append({'word':w.word,'start':float(w.start),'end':float(w.end)})
+            out.append({'start':float(s.start),'end':float(s.end),'text':s.text.strip(),'words':words})
+        tid=str(uuid.uuid4())
+        with connect() as c: c.execute('INSERT INTO transcripts VALUES(?,?,?,?,?)',(tid,pid,getattr(info,'language','unknown'),json.dumps(out,ensure_ascii=False),now()))
+        with connect() as c: c.execute('UPDATE projects SET status=? WHERE id=?',('transcribed',pid))
+        update_job(jid,'completed',100,f'Transcription completed ({len(out)} segments)')
+    except Exception as e: update_job(jid,'failed',100,'Transcription failed',str(e))
+
+def analyze_project(jid,pid):
+    try:
+        update_job(jid,'running',10,'Loading transcript')
+        with connect() as c: tr=c.execute('SELECT * FROM transcripts WHERE project_id=? ORDER BY created_at DESC LIMIT 1',(pid,)).fetchone()
+        if not tr: raise RuntimeError('No transcript found. Transcribe the project first.')
+        segs=json.loads(tr['segments']); p=get_project(pid); duration=max(1,p.get('duration') or 0)
+        # Combine transcript sentences into useful 20-60 second windows and explain heuristic scores.
+        made=[]; i=0
+        while i<len(segs):
+            start=float(segs[i]['start']); j=i; end=float(segs[j]['end'])
+            while j+1<len(segs) and float(segs[j+1]['end'])-start < 45: j+=1; end=float(segs[j]['end'])
+            text=' '.join(x.get('text','') for x in segs[i:j+1]).strip(); low=text.lower()
+            if end-start>=8 and text:
+                signals=[k for k in ['means','defined as','refers to','for example','consider','first','next','in summary','remember','important','the key point','because'] if k in low]
+                score=min(100,55+len(signals)*8+min(10,len(text.split())//20))
+                reasons=['Selected from transcript sentence boundaries']
+                if signals: reasons.append('Educational signals: '+', '.join(signals[:4]))
+                if 20<=end-start<=60: reasons.append('Duration fits a short educational clip')
+                made.append((start,end,(text[:65]+'…') if len(text)>65 else text,score,reasons))
+            i=j+1
+        with connect() as c:
+            c.execute('DELETE FROM clips WHERE project_id=?',(pid,))
+            for start,end,title,score,reasons in made:
+                c.execute('INSERT INTO clips VALUES(?,?,?,?,?,?,?,?,?,?)',(str(uuid.uuid4()),pid,start,end,title,score,json.dumps(reasons),0,'suggested',now()))
+            c.execute('UPDATE projects SET status=? WHERE id=?',('analyzed',pid))
+        update_job(jid,'completed',100,f'Found {len(made)} candidate clips')
+    except Exception as e: update_job(jid,'failed',100,'Analysis failed',str(e))
+
+app=FastAPI(title='Reel Studio AI API',version='1.0.0',description='Local-first educational video clipping backend')
+app.add_middleware(CORSMiddleware,allow_origins=os.getenv('CORS_ORIGINS','http://localhost:3000,http://localhost:3001,http://localhost:5173').split(','),allow_credentials=True,allow_methods=['*'],allow_headers=['*'])
+init_db()
+
+@app.exception_handler(HTTPException)
+async def http_error(request, exc):
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=exc.status_code,content={'error':{'code':f'HTTP_{exc.status_code}','message':str(exc.detail)}})
+@app.get('/health')
+def health():
+    return {'status':'ok','ffmpeg':bool(tool('ffmpeg')),'ffprobe':bool(tool('ffprobe')),'whisper_installed':__import__('importlib').util.find_spec('faster_whisper') is not None,'database':'sqlite','message':'Local backend is ready'}
+@app.get('/api/health')
+def api_health(): return health()
+
+@app.post('/api/auth/register')
+@app.post('/auth/register')
+def register(payload: dict):
+    email=str(payload.get('email','')).strip().lower(); password=str(payload.get('password',''))
+    if '@' not in email or len(password)<6: raise HTTPException(400,'Enter a valid email and password of at least 6 characters')
+    uid=str(uuid.uuid4())
+    # Demo/local auth: hash password with PBKDF2, token is a local opaque session identifier.
+    import hashlib,secrets
+    salt=secrets.token_hex(16); hashed=hashlib.pbkdf2_hmac('sha256',password.encode(),salt.encode(),200000).hex()+':'+salt
+    try:
+        with connect() as c: c.execute('INSERT INTO users VALUES(?,?,?,?)',(uid,email,hashed,now()))
+    except sqlite3.IntegrityError: raise HTTPException(409,'Email already registered')
+    return {'user':{'id':uid,'email':email},'access_token':uid,'token_type':'bearer','token':uid}
+@app.post('/api/auth/login')
+@app.post('/auth/login')
+def login(payload: dict):
+    import hashlib
+    email=str(payload.get('email','')).strip().lower(); password=str(payload.get('password',''))
+    with connect() as c: r=c.execute('SELECT * FROM users WHERE email=?',(email,)).fetchone()
+    if not r: raise HTTPException(401,'Invalid email or password')
+    hashed,salt=r['password'].split(':',1)
+    if hashlib.pbkdf2_hmac('sha256',password.encode(),salt.encode(),200000).hex()!=hashed: raise HTTPException(401,'Invalid email or password')
+    return {'user':{'id':r['id'],'email':email},'access_token':r['id'],'token_type':'bearer','token':r['id']}
+
+@app.post('/api/projects')
+@app.post('/projects')
+async def upload_project(file: UploadFile=File(...), title: Optional[str]=Form(None), background_tasks: BackgroundTasks=None):
+    ext=Path(file.filename or '').suffix.lower()
+    if ext not in ALLOWED: raise HTTPException(415,'Unsupported file type. Upload MP4, MOV, MKV, WEBM, AVI, MP3, WAV or M4A.')
+    pid=str(uuid.uuid4()); dest=UPLOADS/f'{pid}{ext}'; total=0
+    try:
+        with dest.open('wb') as out:
+            while True:
+                chunk=await file.read(1024*1024)
+                if not chunk: break
+                total+=len(chunk)
+                if total>MAX_UPLOAD: raise HTTPException(413,f'Upload exceeds {MAX_UPLOAD//(1024*1024)} MB limit')
+                out.write(chunk)
+        meta=probe(dest)
+        if not meta['has_audio']: raise HTTPException(400,'This file has no audio track. Please upload a lecture or video with audio.')
+        name=(title or Path(file.filename or 'Untitled').stem).strip() or 'Untitled project'
+        with connect() as c: c.execute('INSERT INTO projects VALUES(?,?,?,?,?,?,?,?,?,?)',(pid,name,file.filename or dest.name,str(dest),meta['duration'],meta['width'],meta['height'],1,'uploaded',now()))
+        return {'id':pid,'project_id':pid,'title':name,'filename':file.filename,'duration':meta['duration'],'width':meta['width'],'height':meta['height'],'has_audio':True,'status':'uploaded','created_at':now()}
+    except Exception:
+        dest.unlink(missing_ok=True); raise
+    finally: await file.close()
+@app.get('/api/projects')
+@app.get('/projects')
+def list_projects():
+    with connect() as c: rows=c.execute('SELECT * FROM projects ORDER BY created_at DESC').fetchall()
+    return {'projects':[rowdict(r) for r in rows], 'items':[rowdict(r) for r in rows]}
+@app.get('/api/projects/{pid}')
+@app.get('/projects/{pid}')
+def project_detail(pid:str): return get_project(pid)
+@app.delete('/api/projects/{pid}')
+@app.delete('/projects/{pid}')
+def delete_project(pid:str):
+    p=get_project(pid); Path(p['path']).unlink(missing_ok=True)
+    with connect() as c:
+        c.execute('DELETE FROM transcripts WHERE project_id=?',(pid,)); c.execute('DELETE FROM clips WHERE project_id=?',(pid,)); c.execute('DELETE FROM projects WHERE id=?',(pid,))
+    return {'success':True,'deleted':pid}
+@app.get('/api/projects/{pid}/video')
+@app.get('/projects/{pid}/video')
+def source_video(pid:str, range: Optional[str]=Header(None)):
+    p=get_project(pid); path=Path(p['path'])
+    if not path.exists(): raise HTTPException(404,'Source file missing')
+    size=path.stat().st_size
+    if range and range.startswith('bytes='):
+        a,b=range[6:].split('-',1); start=int(a or 0); end=int(b) if b else size-1; end=min(end,size-1)
+        if start>=size: raise HTTPException(416,'Range not satisfiable')
+        def iterator():
+            with path.open('rb') as f:
+                f.seek(start); remaining=end-start+1
+                while remaining:
+                    data=f.read(min(1024*1024,remaining))
+                    if not data: break
+                    remaining-=len(data); yield data
+        from fastapi.responses import Response
+        return StreamingResponse(iterator(),status_code=206,media_type='video/mp4',headers={'Content-Range':f'bytes {start}-{end}/{size}','Accept-Ranges':'bytes','Content-Length':str(end-start+1)})
+    return FileResponse(path,media_type='video/mp4',headers={'Accept-Ranges':'bytes'})
+
+@app.post('/api/projects/{pid}/transcribe')
+@app.post('/projects/{pid}/transcribe')
+def transcribe(pid:str, background_tasks:BackgroundTasks):
+    get_project(pid); job=create_job('transcribe',pid); background_tasks.add_task(run_transcribe,job['id'],pid); return job
+@app.get('/api/projects/{pid}/transcript')
+@app.get('/projects/{pid}/transcript')
+def transcript(pid:str):
+    get_project(pid)
+    with connect() as c: r=c.execute('SELECT * FROM transcripts WHERE project_id=? ORDER BY created_at DESC LIMIT 1',(pid,)).fetchone()
+    if not r: raise HTTPException(404,'Transcript not available yet. Start transcription first.')
+    d=rowdict(r); d['segments']=json.loads(d['segments']); return d
+@app.post('/api/projects/{pid}/analyze')
+@app.post('/projects/{pid}/analyze')
+def analyze(pid:str, background_tasks:BackgroundTasks):
+    get_project(pid); job=create_job('analyze',pid); background_tasks.add_task(analyze_project,job['id'],pid); return job
+@app.get('/api/projects/{pid}/clips')
+@app.get('/projects/{pid}/clips')
+def project_clips(pid:str):
+    get_project(pid)
+    with connect() as c: rows=c.execute('SELECT * FROM clips WHERE project_id=? ORDER BY score DESC',(pid,)).fetchall()
+    clips=[]
+    for r in rows:
+        d=rowdict(r); d['reasons']=json.loads(d['reasons']); d['context_warning']=bool(d['context_warning']); clips.append(d)
+    return {'clips':clips,'items':clips}
+
+class ClipCreate(BaseModel):
+    start: float=Field(ge=0); end: float=Field(gt=0); title: str='Untitled clip'
+class ClipPatch(BaseModel):
+    start: Optional[float]=Field(default=None,ge=0); end: Optional[float]=Field(default=None,gt=0); title: Optional[str]=None; status: Optional[str]=None
+@app.post('/api/projects/{pid}/clips')
+@app.post('/projects/{pid}/clips')
+def create_clip(pid:str, body:ClipCreate):
+    p=get_project(pid)
+    if body.end<=body.start or body.end>float(p['duration'])+0.5: raise HTTPException(400,'Clip boundaries must be within the source video duration')
+    cid=str(uuid.uuid4())
+    with connect() as c: c.execute('INSERT INTO clips VALUES(?,?,?,?,?,?,?,?,?,?)',(cid,pid,body.start,body.end,body.title,50,json.dumps(['Manually created clip']),0,'draft',now()))
+    return get_clip(cid)
+@app.patch('/api/clips/{cid}')
+@app.patch('/clips/{cid}')
+def patch_clip(cid:str, body:ClipPatch):
+    d=get_clip(cid); updates=body.model_dump(exclude_unset=True)
+    start=updates.get('start',d['start']); end=updates.get('end',d['end'])
+    if end<=start: raise HTTPException(400,'Clip end must be after clip start')
+    if updates:
+        with connect() as c: c.execute('UPDATE clips SET start=?,end=?,title=?,status=? WHERE id=?',(start,end,updates.get('title',d['title']),updates.get('status',d['status']),cid))
+    return get_clip(cid)
+@app.delete('/api/clips/{cid}')
+@app.delete('/clips/{cid}')
+def delete_clip(cid:str):
+    get_clip(cid)
+    with connect() as c: c.execute('DELETE FROM clips WHERE id=?',(cid,))
+    return {'success':True}
+
+@app.post('/api/clips/{cid}/render')
+@app.post('/clips/{cid}/render')
+def render_clip(cid:str, background_tasks:BackgroundTasks):
+    clip=get_clip(cid); job=create_job('render',cid); background_tasks.add_task(run_render,job['id'],clip); return job
+
+def run_render(jid,clip):
+    try:
+        ffmpeg=tool('ffmpeg')
+        if not ffmpeg: raise RuntimeError('FFmpeg is not installed or not on PATH.')
+        p=get_project(clip['project_id']); src=Path(p['path']); eid=str(uuid.uuid4()); out=RENDERS/f'{eid}.mp4'
+        update_job(jid,'running',10,'Rendering vertical video')
+        duration=float(clip['end'])-float(clip['start'])
+        vf="scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30,format=yuv420p"
+        cmd=[ffmpeg,'-y','-ss',str(clip['start']),'-i',str(src),'-t',str(duration),'-vf',vf,'-c:v','libx264','-preset','veryfast','-crf','23','-c:a','aac','-b:a','128k','-movflags','+faststart',str(out)]
+        subprocess.run(cmd,capture_output=True,text=True,timeout=max(180,int(duration*12)),check=True)
+        update_job(jid,'running',85,'Validating rendered video')
+        meta=probe(out); report={'exists':out.exists(),'non_empty':out.exists() and out.stat().st_size>0,'has_video':meta['has_video'],'has_audio':meta['has_audio'],'width':meta['width'],'height':meta['height'],'duration':meta['duration'],'resolution_ok':meta['width']==1080 and meta['height']==1920,'duration_ok':abs(meta['duration']-duration)<=1.0}
+        ok=all(report[k] for k in ['exists','non_empty','has_video','has_audio','resolution_ok','duration_ok'])
+        with connect() as c: c.execute('INSERT INTO exports VALUES(?,?,?,?,?,?,?,?,?,?)',(eid,cid,clip['project_id'],str(out),meta['width'],meta['height'],meta['duration'],'completed' if ok else 'failed',json.dumps(report),now()))
+        if not ok: raise RuntimeError('Render failed validation: '+json.dumps(report))
+        update_job(jid,'completed',100,'Render completed and validated')
+    except Exception as e: update_job(jid,'failed',100,'Render failed',str(e))
+@app.get('/api/clips/{cid}/exports')
+@app.get('/clips/{cid}/exports')
+def clip_exports(cid:str):
+    get_clip(cid)
+    with connect() as c: rows=c.execute('SELECT * FROM exports WHERE clip_id=? ORDER BY created_at DESC',(cid,)).fetchall()
+    result=[]
+    for r in rows:
+        d=rowdict(r); d['validation_report']=json.loads(d['validation_report']); result.append(d)
+    return {'exports':result,'items':result}
+@app.get('/api/exports/{eid}/download')
+@app.get('/exports/{eid}/download')
+def export_download(eid:str):
+    with connect() as c: r=c.execute('SELECT * FROM exports WHERE id=?',(eid,)).fetchone()
+    if not r: raise HTTPException(404,'Export not found')
+    if r['status']!='completed' or not Path(r['path']).exists(): raise HTTPException(409,'Export is not available because it failed validation')
+    return FileResponse(r['path'],filename=f'reel-{eid}.mp4',media_type='video/mp4')
+@app.get('/api/exports/{eid}/preview')
+@app.get('/exports/{eid}/preview')
+def export_preview(eid:str): return export_download(eid)
+@app.get('/api/jobs/{jid}')
+@app.get('/jobs/{jid}')
+def get_job(jid:str):
+    with connect() as c: r=c.execute('SELECT * FROM jobs WHERE id=?',(jid,)).fetchone()
+    if not r: raise HTTPException(404,'Job not found')
+    return rowdict(r)
+@app.get('/api/jobs/{jid}/events')
+@app.get('/jobs/{jid}/events')
+def job_events(jid:str):
+    get_job(jid)
+    def events():
+        for _ in range(60):
+            with connect() as c: r=c.execute('SELECT * FROM jobs WHERE id=?',(jid,)).fetchone()
+            if not r: break
+            yield 'data: '+json.dumps(rowdict(r))+'\n\n'
+            if r['status'] in ('completed','failed','cancelled'): break
+            time.sleep(1)
+    return StreamingResponse(events(),media_type='text/event-stream',headers={'Cache-Control':'no-cache','X-Accel-Buffering':'no'})
+
+@app.get('/api/presets')
+@app.get('/presets')
+def presets():
+    return {'presets':[{'id':'default','name':'Clean Education','caption_style':{'font':'Arial','size':54,'color':'#FFFFFF','outline':3,'position':'bottom'},'branding':{},'is_default':True},{'id':'bold','name':'Bold Highlight','caption_style':{'font':'Arial','size':60,'color':'#FFFF00','outline':4,'position':'bottom'},'branding':{},'is_default':False}]}
+@app.post('/api/projects/{pid}/series')
+def series_stub(pid:str): get_project(pid); raise HTTPException(501,'Series builder is not enabled in this MVP yet.')
+@app.post('/api/exports/{eid}/publish')
+def publish_stub(eid:str): raise HTTPException(501,'Publishing is not configured. Official YouTube or Instagram credentials and permissions are required.')
+@app.post('/api/exports/{eid}/schedule')
+def schedule_stub(eid:str): raise HTTPException(501,'Publishing schedule is not configured yet.')
+
+if __name__=='__main__':
+    import uvicorn
+    uvicorn.run('app.main:app',host='0.0.0.0',port=int(os.getenv('PORT','8000')),reload=False)
